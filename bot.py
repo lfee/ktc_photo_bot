@@ -16,6 +16,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from utils import with_rate_limit, exponential_backoff
+from localization import Messages, Errors
+from error_handling import retry_on_telegram_error
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -29,11 +32,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Проверка наличия токенов
 if not TELEGRAM_TOKEN:
-    raise ValueError("Отсутствует TELEGRAM_TOKEN в файле .env")
+    raise ValueError("TELEGRAM_TOKEN missing in .env file")
 if not OPENAI_API_KEY:
-    raise ValueError("Отсутствует OPENAI_API_KEY в файле .env")
+    raise ValueError(Messages.ERR_OPENAI_KEY)
 if not GEMINI_API_KEY:
-    raise ValueError("Отсутствует GEMINI_API_KEY в файле .env")
+    raise ValueError("GEMINI_API_KEY missing in .env file")
 
 # Очистка токенов от лишних пробелов
 OPENAI_API_KEY = OPENAI_API_KEY.strip() if OPENAI_API_KEY else None
@@ -72,20 +75,21 @@ class EditStates(StatesGroup):
 # Функция создания клавиатуры выбора сервиса
 def get_service_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.button(text="OpenAI", callback_data=f"service:{AIService.OPENAI}")
-    builder.button(text="Google AI", callback_data=f"service:{AIService.GOOGLE}")
+    builder.button(text=Messages.BTN_OPENAI, callback_data=f"service:{AIService.OPENAI}")
+    builder.button(text=Messages.BTN_GOOGLE, callback_data=f"service:{AIService.GOOGLE}")
     builder.adjust(2)
     return builder.as_markup()
 
 
 # --- Функции обработки изображений ---
+@with_rate_limit(calls=10, period=60.0)  # Максимум 10 запросов в минуту к Google Vision
 async def call_google_vision(image_path: str, prompt: str) -> Optional[str]:
     try:
         import cv2
         import numpy as np
         from PIL import Image, ImageEnhance, ImageFilter
     except ImportError:
-        raise ImportError("Пожалуйста, установите необходимые библиотеки: pip install opencv-python pillow")
+        raise ImportError(Messages.ERR_MISSING_LIBRARIES)
 
     headers = {"Authorization": f"Bearer {GEMINI_API_KEY}"}
     output_path = str(Path(image_path).with_suffix('.edited.png'))
@@ -205,19 +209,20 @@ async def call_google_vision(image_path: str, prompt: str) -> Optional[str]:
 
                         # Сохраняем обработанное изображение
                         image.save(output_path, 'PNG', quality=95)
-                        logger.info(f"Google Vision API успешно обработал изображение")
+                        logger.info(Messages.LOG_PROCESSING_SUCCESS.format(output_path))
                         return output_path
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt == MAX_RETRIES - 1:
-                    logger.error(f"Ошибка при обработке изображения после {MAX_RETRIES} попыток: {e}")
+                    logger.error(Messages.LOG_PROCESSING_ERROR.format(MAX_RETRIES, e))
                     raise
                 await asyncio.sleep(2 ** attempt)
 
             except Exception as e:
-                logger.error(f"Неожиданная ошибка при обработке изображения: {e}")
+                logger.error(Messages.LOG_UNEXPECTED_ERROR.format(e))
                 raise
 
+@with_rate_limit(calls=3, period=60.0)  # Максимум 3 запроса в минуту к OpenAI
 async def call_openai_image_edit(image_path: str, prompt: str, size="1024x1024") -> Optional[str]:
     if not OPENAI_API_KEY:
         raise ValueError("OpenAI API ключ не найден. Пожалуйста, проверьте наличие OPENAI_API_KEY в файле .env")
@@ -274,19 +279,19 @@ async def call_openai_image_edit(image_path: str, prompt: str, size="1024x1024")
                                 lambda: Path(output_path).write_bytes(content)
                             )
                     else:
-                        raise ValueError("Unexpected response from OpenAI")
+                        raise ValueError(Messages.ERR_CREATION_FAILED)
 
-                    logger.info(f"Изображение успешно обработано: {output_path}")
+                    logger.info(Messages.LOG_PROCESSING_SUCCESS.format(output_path))
                     return output_path
             
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt == MAX_RETRIES - 1:
-                    logger.error(f"Ошибка при обработке изображения после {MAX_RETRIES} попыток: {e}")
+                    logger.error(Messages.LOG_PROCESSING_ERROR.format(MAX_RETRIES, e))
                     raise
                 await asyncio.sleep(2 ** attempt)  # Экспоненциальная задержка
 
             except Exception as e:
-                logger.error(f"Неожиданная ошибка при обработке изображения: {e}")
+                logger.error(Messages.LOG_UNEXPECTED_ERROR.format(e))
                 raise
 
 
@@ -299,29 +304,28 @@ async def cleanup_old_files(max_age_hours: int = 24):
             if current_time - file.stat().st_mtime > max_age_hours * 3600:
                 file.unlink()
     except Exception as e:
-        logger.error(f"Ошибка при очистке временных файлов: {e}")
+        logger.error(Messages.LOG_CLEANUP_ERROR.format(e))
 
 
 # --- Команда /start ---
 @dp.message(Command("start"))
+@retry_on_telegram_error(max_retries=3)
 async def cmd_start(message: Message):
-    await message.answer(
-        "👋 Привет! Отправь мне фото, и я помогу тебе изменить его.\n"
-        "🤖 Доступные сервисы: OpenAI и Google AI\n"
-        "📸 Максимальный размер фото: 4MB"
-    )
+    await message.answer(Messages.WELCOME)
     # Очищаем старые временные файлы при старте
     await cleanup_old_files()
 
 
 # Обработка выбора сервиса
 @dp.callback_query(lambda c: c.data.startswith("service:"))
+@with_rate_limit(calls=5, period=1.0)  # Максимум 5 запросов в секунду для UI
 async def process_service_choice(callback_query: CallbackQuery, state: FSMContext):
     service = callback_query.data.split(":")[1]
     await state.update_data(service=service)
     
-    await callback_query.message.edit_text(
-        "✏️ Как вы хотите изменить это изображение?",
+    await exponential_backoff(
+        callback_query.message.edit_text,
+        Messages.ENTER_PROMPT,
         reply_markup=None
     )
     await state.set_state(EditStates.waiting_for_prompt)
@@ -330,10 +334,17 @@ async def process_service_choice(callback_query: CallbackQuery, state: FSMContex
 
 # --- Пользователь прислал фото ---
 @dp.message(F.photo)
+@with_rate_limit(calls=3, period=1.0)  # Максимум 3 запроса в секунду
+@retry_on_telegram_error(max_retries=3)
 async def handle_photo(message: Message, state: FSMContext):
     try:
         photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
+        file_info = await exponential_backoff(
+            bot.get_file,
+            photo.file_id,
+            initial_delay=1.0,
+            max_retries=3
+        )
         
         # Создаем уникальное имя файла во временной директории
         input_path = TEMP_DIR / f"tmp_{message.chat.id}_{message.message_id}.jpg"
@@ -341,26 +352,26 @@ async def handle_photo(message: Message, state: FSMContext):
         # Проверяем размер файла
         if file_info.file_size and file_info.file_size > MAX_IMAGE_SIZE:
             await message.answer(
-                f"⚠️ Изображение слишком большое. Максимальный размер: {MAX_IMAGE_SIZE // 1024 // 1024}MB"
+                Messages.ERR_IMAGE_TOO_LARGE.format(MAX_IMAGE_SIZE // 1024 // 1024)
             )
             return
 
         await bot.download_file(file_info.file_path, str(input_path))
-        logger.info(f"Получено изображение: {input_path}")
+        logger.info(Messages.LOG_IMAGE_RECEIVED.format(input_path))
 
         # Сохраняем путь к фото в FSM
         await state.update_data(image_path=str(input_path))
         
         # Предлагаем выбрать сервис для обработки
         await message.answer(
-            "🤖 Выберите сервис для обработки изображения:",
+            Messages.CHOOSE_SERVICE,
             reply_markup=get_service_keyboard()
         )
         await state.set_state(EditStates.choosing_service)
 
     except Exception as e:
-        logger.error(f"Ошибка при получении фото: {e}")
-        await message.answer("⚠️ Произошла ошибка при получении фото. Попробуйте еще раз.")
+        logger.error(Messages.LOG_UNEXPECTED_ERROR.format(e))
+        await message.answer(Messages.ERR_PHOTO_PROCESSING)
         await state.clear()
 
 
@@ -372,16 +383,16 @@ async def handle_prompt(message: Message, state: FSMContext):
     service = user_data.get("service", AIService.OPENAI)
     
     if not image_path or not Path(image_path).exists():
-        await message.answer("⚠️ Изображение не найдено. Пожалуйста, отправьте фото заново.")
+        await message.answer(Messages.ERR_IMAGE_NOT_FOUND)
         await state.clear()
         return
 
     prompt = message.text.strip()
     if not prompt:
-        await message.answer("⚠️ Пожалуйста, опишите желаемые изменения.")
+        await message.answer(Messages.ERR_NO_PROMPT)
         return
 
-    await message.answer("🪄 Обрабатываю изображение... это может занять несколько секунд.")
+    await message.answer(Messages.PROCESSING)
     await state.set_state(EditStates.waiting_for_result)
 
     try:
@@ -392,22 +403,22 @@ async def handle_prompt(message: Message, state: FSMContext):
         if output_path and Path(output_path).exists():
             async with aiohttp.ClientSession() as session:
                 with open(output_path, "rb") as f:
-                    await message.answer_photo(f, caption=f"✅ Готово! (обработано через {service})")
+                    await message.answer_photo(f, caption=Messages.DONE.format(service))
         else:
-            raise ValueError("Не удалось создать изображение")
+            raise ValueError(Messages.ERR_CREATION_FAILED)
 
     except ValueError as ve:
         error_msg = str(ve)
-        logger.error(f"Ошибка валидации: {error_msg}")
-        await message.answer(f"⚠️ {error_msg}")
+        logger.error(Messages.LOG_UNEXPECTED_ERROR.format(error_msg))
+        await message.answer(Messages.ERR_API_ERROR.format(error_msg))
     except ImportError as ie:
         error_msg = str(ie)
-        logger.error(f"Ошибка импорта библиотек: {error_msg}")
-        await message.answer(f"⚠️ Техническая ошибка: {error_msg}")
+        logger.error(Messages.LOG_UNEXPECTED_ERROR.format(error_msg))
+        await message.answer(Messages.ERR_MISSING_LIBRARIES)
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Неожиданная ошибка при обработке изображения: {error_msg}")
-        await message.answer(f"⚠️ Произошла ошибка при обработке изображения: {error_msg}")
+        logger.error(Messages.LOG_UNEXPECTED_ERROR.format(error_msg))
+        await message.answer(Messages.ERR_API_ERROR.format(error_msg))
 
     finally:
         # Удаляем временные файлы
@@ -416,15 +427,40 @@ async def handle_prompt(message: Message, state: FSMContext):
                 if file.exists():
                     file.unlink()
         except Exception as e:
-            logger.error(f"Ошибка при удалении временных файлов: {e}")
+            logger.error(Messages.LOG_CLEANUP_ERROR.format(e))
         await state.clear()
 
 
 # --- Запуск бота ---
+async def ensure_no_webhook():
+    """Проверяет и удаляет webhook если он активен"""
+    webhook_info = await bot.get_webhook_info()
+    if webhook_info.url:
+        logger.warning(f"Обнаружен активный webhook {webhook_info.url}, удаляем...")
+        await bot.delete_webhook()
+        logger.info("Webhook успешно удален")
+
 async def main():
-    print("✅ Бот запущен (aiogram 3.x, с диалогом для prompt)")
-    await dp.start_polling(bot)
+    print(Messages.LOG_BOT_STARTED)
+    
+    # Проверяем и удаляем webhook перед запуском polling
+    await ensure_no_webhook()
+    
+    # Настраиваем polling с правильными параметрами
+    await dp.start_polling(
+        bot,
+        allowed_updates=["message", "callback_query"],  # Указываем типы обновлений
+        polling_timeout=30,  # Таймаут для long polling
+        max_delay=3.0,  # Максимальная задержка между попытками
+        handle_signals=True  # Обработка сигналов для корректного завершения
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+        raise
